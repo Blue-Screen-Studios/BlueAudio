@@ -1,0 +1,21 @@
+# Build output (any case: build/, Build/, BUILD/), including the demo and tests
+[Bb]uild/
+BUILD/
+build-*/
+[Bb]uild_*/
+cmake-build-*/
+out/
+
+# CMake run in the source tree
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+compile_commands.json
+
+# Editors and tools
+.cache/
+.vscode/
+.idea/
+.vs/
+*.swp
+.DS_Store
