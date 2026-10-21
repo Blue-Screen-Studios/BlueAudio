@@ -1,5 +1,6 @@
 /* The simulation: rays from the listener out every way (a Fibonacci sphere,
- * turned at random each time), bouncing off the voxels. At each bounce:
+ * turned each time by the next of an even sequence of turns), bouncing off
+ * the voxels. At each bounce:
  *
  *   - each source it can see: a path the sound comes in by, heard from the
  *     way the ray first went out (round a corner: from the corner), its
@@ -7,7 +8,9 @@
  *   - the listener, if it can see it: the echo (the sound coming back).
  *
  * Each source also straight to the listener, through whatever's between
- * (each solid cell letting its transmission through). Energies relative to
+ * (each solid cell letting its transmission through): to points over a
+ * square about it, their amplitudes averaged (an edge passed: faded
+ * through a step at a time, not snapped). Energies relative to
  * the source heard with nothing in the way (1/d^2): a diffuse bounce seen
  * by one ray of N, 4 cos(theta) d^2 / (N r^2) of it (r: the bounce to the
  * source; the radiance of a surface the same from any distance). */
@@ -23,10 +26,11 @@ typedef struct bau__acc {
   bau_source* src;
   bau__v3 pos;
   float radius, reach, distance;
-  int active, occluded, last_ray, rays;
-  float direct[BAU__BANDS], reflected[BAU__BANDS];
+  const bau_grid* grid;  /* (its own: not in its way) */
+  int active, occluded, last_ray, rays, moved;
+  float through[BAU__BANDS], reflected[BAU__BANDS];
   bau__v3 arrive;
-  float path;  /* (summed: length * mid energy) */
+  float shortest;  /* (m: the shortest path that found it) */
 } bau__acc;
 
 static double bau__now_ms(void) {
@@ -43,9 +47,15 @@ static bau__v3 bau__diffuse(bau__v3 n, uint32_t* rng) {
   return bau__norm(bau__add(bau__add(bau__mul(t, cosf(phi) * sr), bau__mul(b, sinf(phi) * sr)), bau__mul(n, sqrtf(1.0f - r2))));
 }
 
-/* A rotation at random (a unit quaternion, uniformly: Shoemake's). */
-static void bau__random_rotation(uint32_t* rng, float m[9]) {
-  const float u1 = bau__rand(rng), u2 = bau__rand(rng) * 2.0f * BAU__PI, u3 = bau__rand(rng) * 2.0f * BAU__PI;
+/* The k-th turn of an even sequence of them: Shoemake's uniform rotation of
+ * three numbers, those the k-th of an R3 sequence (Roberts': the plastic
+ * number's powers), so turns one after another cover every way evenly
+ * (results averaged over a few simulates settle faster than at random). */
+static void bau__sequence_rotation(uint32_t k, uint32_t seed, float m[9]) {
+  const double g = 1.22074408460575947536;
+  const double off = (double)(seed % 1000u) / 1000.0;
+  const double v1 = fmod(off + (double)k / g, 1.0), v2 = fmod(off + (double)k / (g * g), 1.0), v3 = fmod(off + (double)k / (g * g * g), 1.0);
+  const float u1 = (float)v1, u2 = (float)v2 * 2.0f * BAU__PI, u3 = (float)v3 * 2.0f * BAU__PI;
   const float a = sqrtf(1.0f - u1), b = sqrtf(u1);
   const float x = a * sinf(u2), y = a * cosf(u2), z = b * sinf(u3), w = b * cosf(u3);
   m[0] = 1 - 2 * (y * y + z * z), m[1] = 2 * (x * y - z * w), m[2] = 2 * (x * z + y * w);
@@ -132,17 +142,29 @@ void bau_simulate(bau_context* au) {
     bau__unlock(&au->world);
     return;
   }
+  /* (Moved since the last: what's published follows faster.) */
+  const int listener_moved = bau__len(bau__sub(L, bau__vp(au->simulated_from))) > BAU__MOVED;
+  bau__store(L, au->simulated_from);
   {
     int i = 0;
     for (bau_source* s = au->sources; s; s = s->next, ++i) {
-      acc[i].src = s, acc[i].pos = bau__vp(s->pos), acc[i].radius = s->radius;
-      acc[i].reach = s->max < reach ? s->max : reach, acc[i].last_ray = -1;
+      acc[i].src = s, acc[i].pos = bau__vp(s->pos), acc[i].radius = s->radius, acc[i].grid = s->grid;
+      acc[i].reach = s->max < reach ? s->max : reach, acc[i].last_ray = -1, acc[i].shortest = 1e30f;
+      acc[i].moved = listener_moved || bau__len(bau__sub(acc[i].pos, bau__vp(s->simulated_at))) > BAU__MOVED;
+      bau__store(acc[i].pos, s->simulated_at);
     }
   }
   uint32_t rng = au->rng;
+  const uint32_t turn = au->simulations++;
   bau__unlock(&au->state);
 
-  /* Straight: each source to the listener, through what's between. */
+  const float golden = BAU__PI * (3.0f - sqrtf(5.0f));
+  /* Straight: each source to the listener, through what's between: to
+   * points over a square about it (square to the line), a rook's pattern
+   * (each its own column, its own row: no two pass an upright edge or a
+   * level one at once). What gets through averaged as amplitude (each
+   * point that passes an edge brings a twelfth of it back, not the first
+   * one most of it); occluded, most of it kept out. */
   long shadow = 0;
   for (int j = 0; j < ns; ++j) {
     bau__acc* a = &acc[j];
@@ -150,23 +172,35 @@ void bau_simulate(bau_context* au) {
     a->distance = bau__len(to);
     a->active = a->distance <= a->reach;
     if (!a->active) continue;
-    float t[BAU__BANDS];
     const bau__v3 dir = a->distance > 1e-6f ? bau__mul(to, 1.0f / a->distance) : bau__v(0.0f, 0.0f, -1.0f);
-    a->occluded = bau__transmit(au, L, dir, lr, a->distance - a->radius, t) > 0;
-    ++shadow;
-    for (int b = 0; b < BAU__BANDS; ++b) a->direct[b] = t[b] * expf(-bau__air[b] * a->distance);
+    const bau__v3 side = bau__norm(fabsf(dir.y) < 0.9f ? bau__cross(dir, bau__v(0.0f, 1.0f, 0.0f)) : bau__cross(dir, bau__v(1.0f, 0.0f, 0.0f)));
+    const bau__v3 lift = bau__cross(side, dir);
+    for (int b = 0; b < BAU__BANDS; ++b) a->through[b] = 0.0f;
+    for (int k = 0; k < BAU__OCCLUSION_RAYS; ++k) {
+      const int row = (k * 5) % BAU__OCCLUSION_RAYS;  /* (5: shares no factor with 12) */
+      const float across = (((float)k + 0.5f) / (float)BAU__OCCLUSION_RAYS * 2.0f - 1.0f) * BAU__OCCLUSION_SPREAD;
+      const float up = (((float)row + 0.5f) / (float)BAU__OCCLUSION_RAYS * 2.0f - 1.0f) * BAU__OCCLUSION_SPREAD;
+      const bau__v3 end = bau__add(a->pos, bau__add(bau__mul(side, across), bau__mul(lift, up)));
+      const bau__v3 v = bau__sub(end, L);
+      const float len = bau__len(v);
+      float t[BAU__BANDS];
+      bau__transmit(au, L, bau__mul(v, 1.0f / (len > 1e-6f ? len : 1.0f)), lr, len - a->radius, t, a->grid);
+      ++shadow;
+      for (int b = 0; b < BAU__BANDS; ++b) a->through[b] += sqrtf(t[b]) / (float)BAU__OCCLUSION_RAYS;
+    }
+    for (int b = 0; b < BAU__BANDS; ++b) a->through[b] *= a->through[b];  /* (amplitude back to intensity) */
+    a->occluded = a->through[1] < 0.25f;
   }
 
   /* The rays. */
   float rot[9];
-  bau__random_rotation(&rng, rot);
+  bau__sequence_rotation(turn, au->cfg.seed, rot);
   float hist[BAU__BINS] = {0}, hist_dir[BAU__BINS][3] = {{0}};
   bau_ray rays[BAU__DEBUG_RAYS];
   int nrays = 0;
   long seen = 0;
   double absorbed = 0.0, path = 0.0;
   long hits = 0, segments = 0, misses = 0, later = 0, later_misses = 0;
-  const float golden = BAU__PI * (3.0f - sqrtf(5.0f));
   for (int k = 0; k < N; ++k) {
     const float y = 1.0f - 2.0f * ((float)k + 0.5f) / (float)N, r = sqrtf(1.0f - y * y), phi = golden * (float)k;
     const bau__v3 f = bau__v(cosf(phi) * r, y, sinf(phi) * r);
@@ -200,7 +234,7 @@ void bau_simulate(bau_context* au) {
         const float cosine = bau__dot(n, u);
         if (cosine <= 0.0f) continue;
         ++shadow;
-        if (!bau__clear(au, off, u, 0.0f, rr - a->radius)) continue;
+        if (!bau__clear(au, off, u, 0.0f, rr - a->radius, a->grid)) continue;
         const float r1 = rr < 1.0f ? 1.0f : rr, d2 = a->distance * a->distance;
         float base = invN * cosine * d2 / (r1 * r1);
         if (base > 1.0f) base = 1.0f; /* (a bounce right beside the source: no one ray's spike) */
@@ -211,7 +245,7 @@ void bau_simulate(bau_context* au) {
           a->reflected[b] += c[b];
         }
         a->arrive = bau__add(a->arrive, bau__mul(first, c[1]));
-        a->path += c[1] * total;
+        if (total < a->shortest) a->shortest = total;
         if (a->last_ray != k) a->last_ray = k, ++a->rays;
         pts[bounce + 2] = a->pos;
         bau__keep_ray(rays, &nrays, &seen, &rng, a->src, pts, bounce + 3, sqrtf(c[1]));
@@ -224,7 +258,7 @@ void bau_simulate(bau_context* au) {
         const float cosine = bau__dot(n, u);
         if (cosine > 0.0f && rr > 1e-4f) {
           ++shadow;
-          if (bau__clear(au, off, u, 0.0f, rr - lr)) {
+          if (bau__clear(au, off, u, 0.0f, rr - lr, NULL)) {
             const float r1 = rr < 1.0f ? 1.0f : rr;
             const float e = invN * cosine / (r1 * r1) * w[1] * (1.0f - m->absorption[1]);
             const int bin = (int)((length + rr) / BAU__SPEED / BAU__BIN);
@@ -256,26 +290,28 @@ void bau_simulate(bau_context* au) {
     bau_source* s = au->sources;
     while (s && s != a->src) s = s->next;
     if (!s) continue; /* (destroyed meanwhile) */
-    const float blend = s->simulated ? BAU__BLEND : 1.0f;
-    s->distance = a->distance, s->occluded = a->active ? a->occluded : 1;
+    const float blend = !s->simulated ? 1.0f : a->moved ? BAU__BLEND_MOVING : BAU__BLEND_STILL;
+    s->occluded = a->active ? a->occluded : 1;
     s->reached = a->rays;
     s->reach = bau__lerp(s->reach, (float)a->rays / (float)N, blend);
-    float mid_before = s->reflected[1];
+    const float before = s->reflected[1];
     for (int b = 0; b < BAU__BANDS; ++b) {
-      s->direct[b] = a->active ? a->direct[b] : 0.0f;
+      /* (Straight: deterministic, as it is; the rest blended.) */
+      s->through[b] = a->active ? a->through[b] : 0.0f;
       s->reflected[b] = bau__lerp(s->reflected[b], a->active ? a->reflected[b] : 0.0f, blend);
     }
-    for (int i = 0; i < 3; ++i) {
-      const float v = i == 0 ? a->arrive.x : i == 1 ? a->arrive.y : a->arrive.z;
-      s->arrive[i] = bau__lerp(s->arrive[i], v, blend);
-    }
-    if (a->reflected[1] > 1e-12f) {
-      const float mean_path = a->path / a->reflected[1];
-      s->path = mid_before > 1e-12f ? bau__lerp(s->path, mean_path, blend) : mean_path;
+    s->arrive[0] = bau__lerp(s->arrive[0], a->arrive.x, blend);
+    s->arrive[1] = bau__lerp(s->arrive[1], a->arrive.y, blend);
+    s->arrive[2] = bau__lerp(s->arrive[2], a->arrive.z, blend);
+    /* The way round: the shortest the rays found, past the straight line;
+     * none found this time, the last kept. */
+    if (a->shortest < 1e29f) {
+      const float detour = a->shortest > a->distance ? a->shortest - a->distance : 0.0f;
+      s->detour = before > 1e-12f ? bau__lerp(s->detour, detour, blend) : detour;
     }
     s->simulated = 1;
   }
-  const float blend = au->echo_set ? BAU__BLEND : 1.0f;
+  const float blend = !au->echo_set ? 1.0f : listener_moved ? BAU__BLEND_MOVING : BAU__BLEND_STILL;
   for (int i = 0; i < BAU__BINS; ++i) {
     au->hist[i] = bau__lerp(au->hist[i], hist[i], blend);
     for (int c = 0; c < 3; ++c) au->hist_dir[i][c] = bau__lerp(au->hist_dir[i][c], hist_dir[i][c], blend);

@@ -103,6 +103,7 @@ bau_source* bau_source_create(bau_context* au, bau_fill_fn fill, void* user) {
   if (!s) return NULL;
   s->au = au, s->fill = fill, s->user = user;
   s->gain = 1.0f, s->ref = 7.0f, s->max = au->cfg.max_distance, s->radius = 0.5f;
+  for (int b = 0; b < BAU__BANDS; ++b) s->through[b] = 1.0f;  /* (not traced yet: as if clear) */
   if (!bau__source_init_render(s)) {
     free(s);
     return NULL;
@@ -141,6 +142,13 @@ void bau_source_set_radius(bau_source* s, float radius) {
   if (!s) return;
   bau__lock(&s->au->state);
   s->radius = radius < 0.0f ? 0.0f : radius;
+  bau__unlock(&s->au->state);
+}
+
+void bau_source_set_grid(bau_source* s, const bau_grid* grid) {
+  if (!s) return;
+  bau__lock(&s->au->state);
+  s->grid = grid;
   bau__unlock(&s->au->state);
 }
 
@@ -195,28 +203,36 @@ void bau_source_heard(const bau_source* s, bau_heard* out) {
 void bau__heard(const bau_source* s, bau_heard* out) {
   const bau_context* au = s->au;
   memset(out, 0, sizeof *out);
-  out->simulated = s->simulated;
-  out->distance = s->distance, out->occluded = s->occluded, out->reach = s->reach;
-  const float roll = bau__rolloff(s, s->distance) * s->gain;
-  out->direct = sqrtf(s->direct[1]) * roll;
+  out->simulated = s->simulated, out->occluded = s->occluded, out->reach = s->reach;
+  /* Where it is, where the listener is: now. */
+  const bau__v3 to = bau__sub(bau__vp(s->pos), bau__vp(au->listener));
+  const float d = bau__len(to);
+  const bau__v3 way = d > 1e-6f ? bau__mul(to, 1.0f / d) : bau__v(0.0f, 0.0f, -1.0f);
+  out->distance = d;
+  float direct[BAU__BANDS];
+  for (int b = 0; b < BAU__BANDS; ++b) direct[b] = s->through[b] * expf(-bau__air[b] * d);
+  const float roll = d > s->max || d > au->cfg.max_distance ? 0.0f : bau__rolloff(s, d) * s->gain;
+  out->direct = sqrtf(direct[1]) * roll;
   out->reflected = sqrtf(s->reflected[1]) * roll;
-  const float mid = s->direct[1] + s->reflected[1], high = s->direct[2] + s->reflected[2];
+  const float mid = direct[1] + s->reflected[1], high = direct[2] + s->reflected[2];
   out->gain = sqrtf(mid > 4.0f ? 4.0f : mid) * roll;
   out->muffle = 1.0f - bau__clamp(sqrtf(high), 0.0f, 1.0f);
   /* Heard from: straight at it (the direct's share), the way the rays went
    * out that found it (the reflections'). */
-  const bau__v3 lp = bau__vp(au->listener), to = bau__norm(bau__sub(bau__vp(s->pos), lp));
-  bau__v3 dir = bau__add(bau__mul(to, s->direct[1]), bau__vp(s->arrive));
-  const float w = s->direct[1] + s->reflected[1];
+  const bau__v3 dir = bau__add(bau__mul(way, direct[1]), bau__vp(s->arrive));
   const float l = bau__len(dir);
-  if (w > 1e-12f && l > 1e-12f) {
+  if (mid > 1e-12f && l > 1e-12f) {
     bau__store(bau__mul(dir, 1.0f / l), out->direction);
-    out->spread = bau__clamp(1.0f - l / w, 0.0f, 1.0f);
+    out->spread = bau__clamp(1.0f - l / mid, 0.0f, 1.0f);
   } else {
-    bau__store(to, out->direction);
+    bau__store(way, out->direction);
   }
-  out->delay = (s->direct[1] * s->distance + s->reflected[1] * s->path) / (w > 1e-12f ? w : 1.0f) / BAU__SPEED;
-  if (w <= 1e-12f) out->delay = s->distance / BAU__SPEED;
+  /* When it first arrives: straight, once enough comes straight through;
+   * all but nothing straight (hidden), the shortest way round; between,
+   * between (no jump as it goes behind something). */
+  const float straight = direct[1] / (direct[1] + s->reflected[1] + 1e-12f);
+  const float round = s->reflected[1] > 1e-9f ? 1.0f - bau__clamp((straight - 0.05f) / 0.2f, 0.0f, 1.0f) : 0.0f;
+  out->delay = (d + s->detour * round) / BAU__SPEED;
 }
 
 void bau_listener_echo(const bau_context* au, bau_echo* out) {

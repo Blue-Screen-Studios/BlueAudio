@@ -366,6 +366,191 @@ static void debug_paths(void) {
   bau_destroy(au);
 }
 
+/* ----------------------------------------------------------- smoothness */
+
+/* A steady 440 Hz tone (its phase its own: each source a `tone`). */
+typedef struct tone { double phase; } tone;
+static int fill_tone(void* user, float* mono, int frames) {
+  tone* t = (tone*)user;
+  for (int i = 0; i < frames; ++i) mono[i] = (float)sin(t->phase), t->phase += 2.0 * 3.14159265358979 * 440.0 / 48000.0;
+  return frames;
+}
+
+/* Still, in a shut concrete hall: the tone's loudness (10 ms at a time)
+ * steady, though each simulate's rays are different. */
+static void still_in_a_hall(void) {
+  printf("still, in a hall\n");
+  bau_context* au = context();
+  world w = make(60, 14, 40, 0.5f, AIR);
+  box(&w, 0, 0, 0, 59, 13, 39, CONCRETE);
+  box(&w, 1, 1, 1, 58, 12, 38, AIR);
+  add(au, &w);
+  listen_at(au, 10, 1.7f, 10);
+  tone t = {0};
+  bau_source* s = bau_source_create(au, fill_tone, &t);
+  const float at[3] = {20, 1.2f, 4};
+  bau_source_set_position(s, at);
+  const int block = 1600, sims = 80;
+  float* out = (float*)malloc(sizeof(float) * block * 2 * sims);
+  float d0 = 1e9f, d1 = 0.0f;
+  for (int k = 0; k < sims; ++k) {
+    bau_simulate(au);
+    bau_render(au, out + (size_t)k * block * 2, block);
+    bau_heard h;
+    bau_source_heard(s, &h);
+    if (k >= 20) d0 = fminf(d0, h.delay), d1 = fmaxf(d1, h.delay);
+  }
+  double lo = 1e9, hi = 0.0;
+  for (int w10 = 20 * block / 480; w10 < sims * block / 480; ++w10) {
+    double e = 0.0;
+    for (int i = 0; i < 480; ++i) e += (double)out[(w10 * 480 + i) * 2] * out[(w10 * 480 + i) * 2];
+    e = sqrt(e / 480.0), lo = fmin(lo, e), hi = fmax(hi, e);
+  }
+  const float straight = sqrtf(100.0f + 0.25f + 36.0f) / 343.0f;
+  expect(fabsf(d0 - straight) < 0.001f && d1 - d0 < 0.0002f, "its delay the straight line's, steady",
+         SAY("%.2f..%.2f ms (straight %.2f)", d0 * 1000.0f, d1 * 1000.0f, straight * 1000.0f));
+  expect(20.0 * log10(hi / lo) < 2.0, "its loudness steady", SAY("%.1f dB from 10 ms to 10 ms", 20.0 * log10(hi / lo)));
+  free(out);
+  bau_destroy(au);
+}
+
+/* A tone driving past at 10 m/s, 8 m off (moved every 60th of a second,
+ * simulated every 30th, rendered 512 frames at a time): its pitch through
+ * the pass a smooth Doppler bend, no bursts. */
+static void driving_past(void) {
+  printf("driving past\n");
+  bau_context* au = context();
+  listen_at(au, 0, 1.7f, 0);
+  tone t = {0};
+  bau_source* s = bau_source_create(au, fill_tone, &t);
+  const int total = 48000 * 3;
+  float* out = (float*)malloc(sizeof(float) * total * 2);
+  double frame = 0.0, sim = 0.0;
+  for (int at = 0; at < total; at += 512) {
+    const double now = at / 48000.0;
+    if (now >= frame) {
+      const float p[3] = {(float)(-15.0 + 10.0 * now), 1.7f, -8.0f};
+      bau_source_set_position(s, p);
+      frame += 1.0 / 60.0;
+    }
+    if (now >= sim) bau_simulate(au), sim += 1.0 / 30.0;
+    bau_render(au, out + (size_t)at * 2, 512);
+  }
+  /* Its pitch (zero crossings, 5 ms at a time) against the smooth Doppler,
+   * through the middle second; how much it moves from one 5 ms to the next
+   * beyond the bend's own. */
+  double worst = 0.0, jitter = 0.0, prev = -1.0, prev_smooth = 0.0;
+  for (int w5 = 200; w5 < 400; ++w5) {
+    const int a = w5 * 240, b = a + 240;
+    double first = -1.0, last = -1.0;
+    int crossings = 0;
+    for (int i = a + 1; i < b; ++i) {
+      const float x0 = out[(i - 1) * 2], x1 = out[i * 2];
+      if (x0 <= 0.0f && x1 > 0.0f) {
+        const double z = i - 1 + x0 / (x0 - x1);
+        if (first < 0.0) first = z;
+        else ++crossings;
+        last = z;
+      }
+    }
+    if (crossings < 1) continue;
+    const double f = crossings * 48000.0 / (last - first);
+    const double now = (a + 120) / 48000.0, x = -15.0 + 10.0 * now, d = sqrt(x * x + 64.0), smooth = 440.0 * 343.0 / (343.0 + 10.0 * x / d);
+    worst = fmax(worst, fabs(f - smooth));
+    if (prev > 0.0) jitter = fmax(jitter, fabs((f - prev) - (smooth - prev_smooth)));
+    prev = f, prev_smooth = smooth;
+  }
+  expect(worst < 3.0 && jitter < 1.0, "its pitch a smooth Doppler bend",
+         SAY("%.2f Hz off it at worst, %.2f Hz from 5 ms to 5 ms past its own (a semitone: 26 Hz)", worst, jitter));
+  free(out);
+  bau_destroy(au);
+}
+
+/* Round a corner, still, fewer rays (as a game short of time): what's
+ * published hardly wanders from one simulate to the next. */
+static void steady_round_a_corner(void) {
+  printf("steady round a corner\n");
+  bau_config c = {0};
+  c.rays = 512;
+  bau_context* au = bau_create(&c);
+  bau_set_material(au, CONCRETE, bau_material_preset(BAU_MATERIAL_CONCRETE));
+  world w = make(64, 8, 64, 0.5f, CONCRETE);
+  box(&w, 28, 1, 20, 31, 6, 50, AIR);
+  box(&w, 28, 1, 20, 56, 6, 23, AIR);
+  add(au, &w);
+  listen_at(au, 15, 2, 24);
+  bau_source* s = source_at(au, 26, 2, 11);
+  float g0 = 1e9f, g1 = 0.0f, turn = 0.0f, prev[3] = {0};
+  for (int k = 0; k < 100; ++k) {
+    bau_simulate(au);
+    bau_heard h;
+    bau_source_heard(s, &h);
+    if (k >= 20) {
+      g0 = fminf(g0, h.gain), g1 = fmaxf(g1, h.gain);
+      turn = fmaxf(turn, angle(prev, h.direction[0], h.direction[1], h.direction[2]));
+    }
+    memcpy(prev, h.direction, sizeof prev);
+  }
+  expect(20.0f * log10f(g1 / g0) < 1.5f && turn < 3.0f, "its loudness and direction steady",
+         SAY("%.1f dB swing, %.1f deg steps at most", 20.0f * log10f(g1 / g0), turn));
+  bau_destroy(au);
+}
+
+/* A source going behind a pillar, a step a simulate: faded, never
+ * snapped (its edge passed by a ring of rays, not one). */
+static void behind_a_pillar(void) {
+  printf("behind a pillar\n");
+  bau_context* au = context();
+  world w = make(80, 10, 80, 0.5f, GROUND);
+  box(&w, 0, 1, 0, 79, 9, 79, AIR);
+  box(&w, 38, 1, 30, 41, 9, 33, CONCRETE); /* (2 m square, z 15..17 m, x 19..21 m) */
+  add(au, &w);
+  listen_at(au, 20, 1.7f, 25);
+  bau_source* s = source_at(au, 14, 1.7f, 5);
+  /* (A step's size against its loudness in the open: a snap, all of it at
+   * once; faded, a little at a time.) */
+  float worst = 0.0f, prev = -1.0f, lo = 1e9f, hi = 0.0f;
+  for (int k = 0; k < 160; ++k) {
+    const float p[3] = {14.0f + 12.0f * (float)k / 160.0f, 1.7f, 5.0f};  /* (7.5 cm a simulate, across behind it) */
+    bau_source_set_position(s, p);
+    bau_simulate(au);
+    bau_heard h;
+    bau_source_heard(s, &h);
+    if (prev >= 0.0f) worst = fmaxf(worst, fabsf(h.gain - prev));
+    prev = h.gain, lo = fminf(lo, h.gain), hi = fmaxf(hi, h.gain);
+  }
+  expect(20.0f * log10f(hi / lo) > 6.0f && worst < 0.15f * hi, "hidden and back, faded",
+         SAY("%.1f dB in all, its biggest step %.0f%% of its loudness", 20.0f * log10f(hi / lo), 100.0f * worst / hi));
+  bau_destroy(au);
+}
+
+/* A source inside its own vehicle's voxels: tied to that grid, not in its
+ * own way. */
+static void its_own_grid(void) {
+  printf("its own grid\n");
+  bau_context* au = context();
+  world w = make(16, 6, 30, 0.5f, CONCRETE); /* a closed box: 8 x 3 x 15 m */
+  box(&w, 1, 1, 1, 14, 4, 28, AIR);
+  bau_grid* truck = add(au, &w);
+  const float corner[3] = {-4, 0, -30};
+  bau_grid_set_pose(truck, corner, 0.0f);
+  listen_at(au, 0, 1.5f, 0);
+  bau_source* engine = source_at(au, 0, 1.5f, -22.5f);  /* (in the box's middle, 7.5 m from its ends) */
+  bau_simulate(au);
+  bau_heard h;
+  bau_source_heard(engine, &h);
+  expect(h.occluded, "untied: shut in by the box", NULL);
+  bau_source_set_grid(engine, truck);
+  bau_simulate(au);
+  bau_source_heard(engine, &h);
+  expect(!h.occluded && h.muffle < 0.2f, "tied to it: clear", SAY("muffle %.2f", h.muffle));
+  bau_grid_destroy(truck);
+  bau_simulate(au);
+  bau_source_heard(engine, &h);
+  expect(!h.occluded, "its grid gone: untied, nothing in the way", NULL);
+  bau_destroy(au);
+}
+
 int main(void) {
   open_field();
   wall_between();
@@ -377,6 +562,11 @@ int main(void) {
   rendering();
   deterministic();
   debug_paths();
+  still_in_a_hall();
+  driving_past();
+  steady_round_a_corner();
+  behind_a_pillar();
+  its_own_grid();
   if (failures) printf("%d FAILED\n", failures);
   else printf("all passed\n");
   return failures ? 1 : 0;

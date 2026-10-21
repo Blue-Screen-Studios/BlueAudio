@@ -4,7 +4,8 @@
  * what came back to the listener; its lines read out differently for each
  * channel (Hadamard rows: no two alike), leaning toward where most came
  * back from. Distinct echoes (a far wall) as taps of their own, each from
- * its way. */
+ * its way: faded in as one's found, out as it's lost, its delay kept while
+ * it's the same echo (one within 12 ms of it): never a jump, a click. */
 
 #include "internal.h"
 
@@ -17,10 +18,13 @@ struct bau__reverb {
   float g[BAU__LINES], lp[BAU__LINES];
   float in_scale, wet, to_wet;
   float lean[3], focus;  /* (listener space) */
+  float leaned[BAU__MAX_CHANNELS];  /* (each channel's share as it is: eased) */
   float* ring;           /* the send, for the taps */
   int ring_mask, ring_at;
-  int taps;
-  float tap_delay[4], tap_gain[4], tap_dir[4][3];
+  struct {
+    float delay, gain, to_gain, dir[3];  /* (delay: samples; gain eased to to_gain; 0 and gone: free) */
+    float pan[BAU__MAX_CHANNELS];
+  } tap[BAU__TAPS];
 };
 
 bau__reverb* bau__reverb_create(int rate) {
@@ -73,24 +77,42 @@ void bau__reverb_set(bau__reverb* r, const bau_echo* e, const float listener[9])
   const bau__v3 lean = bau__to_listener(e->direction, listener);
   bau__store(lean, r->lean);
   r->focus = e->focus;
-  r->taps = e->taps;
+  /* The echoes: each found matched to a tap already sounding (within 12
+   * ms: its delay kept), else given a free one (faded in); taps no longer
+   * found faded out. */
+  int matched[BAU__TAPS] = {0};
   for (int t = 0; t < e->taps; ++t) {
-    r->tap_delay[t] = e->tap_delay[t] * (float)r->rate, r->tap_gain[t] = e->tap_gain[t];
-    bau__store(bau__to_listener(e->tap_direction[t], listener), r->tap_dir[t]);
+    const float delay = e->tap_delay[t] * (float)r->rate;
+    int at = -1;
+    for (int k = 0; k < BAU__TAPS && at < 0; ++k)
+      if (!matched[k] && (r->tap[k].gain > 0.0f || r->tap[k].to_gain > 0.0f) && fabsf(r->tap[k].delay - delay) < 0.012f * (float)r->rate) at = k;
+    for (int k = 0; k < BAU__TAPS && at < 0; ++k)
+      if (!matched[k] && r->tap[k].gain <= 0.0f && r->tap[k].to_gain <= 0.0f) at = k, r->tap[k].delay = delay;
+    if (at < 0) continue;
+    matched[at] = 1;
+    r->tap[at].to_gain = e->tap_gain[t];
+    bau__store(bau__to_listener(e->tap_direction[t], listener), r->tap[at].dir);
   }
+  for (int k = 0; k < BAU__TAPS; ++k)
+    if (!matched[k]) r->tap[k].to_gain = 0.0f;
 }
 
 void bau__reverb_process(bau__reverb* r, const float* send, float* out, int frames, int channels, bau_layout layout) {
   /* Each channel's share of the ring (leaning toward where it came back
-   * from); each tap's. */
-  float lean[BAU__MAX_CHANNELS], taps[4][BAU__MAX_CHANNELS], az[BAU__MAX_CHANNELS];
+   * from), eased toward this call's, ramped across it; each tap's. */
+  float lean[BAU__MAX_CHANNELS], lean0[BAU__MAX_CHANNELS], dlean[BAU__MAX_CHANNELS], az[BAU__MAX_CHANNELS];
   const int speakers = bau__speakers(layout, az);
   int heard = 0;
   for (int c = 0; c < speakers; ++c) heard += az[c] > -999.0f;
   bau__pan(layout, bau__vp(r->lean), 1.0f - r->focus * 0.6f, lean);
-  for (int c = 0; c < channels; ++c) lean[c] *= sqrtf((float)heard);
-  for (int t = 0; t < r->taps; ++t) bau__pan(layout, bau__vp(r->tap_dir[t]), 0.2f, taps[t]);
-  const float ease = 1.0f - expf(-1.0f / (0.05f * (float)r->rate));
+  const float k_lean = 1.0f - expf(-(float)frames / (0.1f * (float)r->rate));
+  for (int c = 0; c < channels; ++c) {
+    const float to = r->leaned[c] + (lean[c] * sqrtf((float)heard) - r->leaned[c]) * k_lean;
+    lean0[c] = r->leaned[c], dlean[c] = (to - r->leaned[c]) / (float)frames, r->leaned[c] = to;
+  }
+  for (int t = 0; t < BAU__TAPS; ++t)
+    if (r->tap[t].gain > 0.0f || r->tap[t].to_gain > 0.0f) bau__pan(layout, bau__vp(r->tap[t].dir), 0.2f, r->tap[t].pan);
+  const float ease = 1.0f - expf(-1.0f / (0.05f * (float)r->rate)), tap_ease = 1.0f - expf(-1.0f / (0.08f * (float)r->rate));
   const float norm = 1.0f / sqrtf((float)BAU__LINES);
   for (int i = 0; i < frames; ++i) {
     r->wet += (r->to_wet - r->wet) * ease;
@@ -107,19 +129,23 @@ void bau__reverb_process(bau__reverb* r, const float* send, float* out, int fram
     float* o = out + (size_t)i * channels;
     if (r->wet > 1e-5f) {
       for (int c = 0; c < channels; ++c) {
-        if (lean[c] == 0.0f) continue;
+        const float share = lean0[c] + dlean[c] * (float)i;
+        if (share == 0.0f) continue;
         float v = 0.0f;
         for (int k = 0; k < BAU__LINES; ++k) {
           const int m = c & k;
           v += ((m ^ (m >> 1) ^ (m >> 2)) & 1) ? -y[k] : y[k];
         }
-        o[c] += v * norm * r->wet * lean[c];
+        o[c] += v * norm * r->wet * share;
       }
     }
     r->ring[r->ring_at] = send[i];
-    for (int t = 0; t < r->taps; ++t) {
-      const float v = r->ring[(r->ring_at - (int)r->tap_delay[t]) & r->ring_mask] * r->tap_gain[t];
-      for (int c = 0; c < channels; ++c) o[c] += v * taps[t][c];
+    for (int t = 0; t < BAU__TAPS; ++t) {
+      if (r->tap[t].gain <= 0.0f && r->tap[t].to_gain <= 0.0f) continue;
+      r->tap[t].gain += (r->tap[t].to_gain - r->tap[t].gain) * tap_ease;
+      if (r->tap[t].to_gain <= 0.0f && r->tap[t].gain < 1e-4f) r->tap[t].gain = 0.0f;  /* (faded out: free) */
+      const float v = r->ring[(r->ring_at - (int)r->tap[t].delay) & r->ring_mask] * r->tap[t].gain;
+      for (int c = 0; c < channels; ++c) o[c] += v * r->tap[t].pan[c];
     }
     r->ring_at = (r->ring_at + 1) & r->ring_mask;
   }

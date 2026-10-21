@@ -1,7 +1,13 @@
 /* The mix: each source's waveform pulled, muffled (its highs cut), delayed
  * (its path's length: moving, Doppler), panned from where it's heard into
  * the layout's channels (over headphones: each ear its own delay, the far
- * one in the head's shadow); its share sent to the echo. */
+ * one in the head's shadow); its share sent to the echo.
+ *
+ * Each render call's targets come from where the source and the listener
+ * are then (the game's frames) and the last simulation's slower part; every
+ * one of them glided to, never jumped: the delay (and each ear's) through
+ * two one-poles (its rate, the pitch, never stepping), the loudness through
+ * one, the muffle and the panning eased chunk by chunk. */
 
 #include "internal.h"
 
@@ -100,20 +106,12 @@ static float bau__pole(float fc, int rate) {
   return fc >= 18000.0f ? 1.0f : 1.0f - expf(-2.0f * BAU__PI * fc / (float)rate);
 }
 
-/* The targets for this render call, from what's published (state lock). */
+/* The targets for this render call: the source and the listener where
+ * they are now, what's published (state lock). (Not traced yet: as if
+ * nothing were in the way.) */
 static void bau__targets(bau_context* au, bau_source* s, const bau__v3 right, const bau__v3 up, const bau__v3 ahead) {
   bau_heard h;
   bau__heard(s, &h);
-  if (!h.simulated) {
-    /* (Not traced yet: straight at it, as if nothing were in the way.) */
-    const bau__v3 to = bau__sub(bau__vp(s->pos), bau__vp(au->listener));
-    const float d = bau__len(to);
-    const float r = d / s->ref;
-    h.gain = s->gain * (d <= s->ref ? 1.0f : 1.0f / (1.0f + (r - 1.0f) * (r + 1.0f)));
-    if (d > s->max) h.gain = 0.0f;
-    h.muffle = 0.0f, h.spread = 0.0f, h.delay = d / BAU__SPEED;
-    bau__store(d > 1e-6f ? bau__mul(to, 1.0f / d) : bau__v(0.0f, 0.0f, 0.0f), h.direction);
-  }
   const float rate = (float)au->cfg.sample_rate;
   s->to_amp = h.gain;
   s->to_cut = 20000.0f * powf(300.0f / 20000.0f, bau__clamp(h.muffle, 0.0f, 1.0f));
@@ -160,42 +158,54 @@ static void bau__source_chunk(bau_context* au, bau_source* s, float* out, float*
     memset(mono, 0, (size_t)n * sizeof(float));
     s->tail -= n;
   }
+  /* (Per sample: one-poles' coefficients for these time constants.) */
+  const float k_delay = 1.0f - expf(-1.0f / (0.025f * (float)rate)), k_itd = 1.0f - expf(-1.0f / (0.02f * (float)rate));
+  const float k_amp = 1.0f - expf(-1.0f / (0.03f * (float)rate));
+  /* (Per chunk: the muffle's, the ears' shadows' and the panning's easing.) */
+  const float k_cut = 1.0f - expf(-(float)n / (0.05f * (float)rate)), k_pan = 1.0f - expf(-(float)n / (0.03f * (float)rate));
   if (!s->started) {
     s->started = 1;
-    s->delay = s->to_delay, s->amp = s->to_amp, s->cut = s->to_cut;
+    s->delay = s->delay_mid = s->to_delay, s->amp = s->to_amp, s->cut = s->to_cut;
     memcpy(s->gains, s->to_gains, sizeof s->gains);
-    memcpy(s->itd, s->to_itd, sizeof s->itd), memcpy(s->shadow, s->to_shadow, sizeof s->shadow);
+    memcpy(s->itd, s->to_itd, sizeof s->itd), memcpy(s->itd_mid, s->to_itd, sizeof s->itd_mid);
+    memcpy(s->shadow, s->to_shadow, sizeof s->shadow);
   }
   /* The muffle (two one-poles: 12 dB an octave), its cutoff eased. */
-  s->cut += (s->to_cut - s->cut) * 0.3f;
+  s->cut += (s->to_cut - s->cut) * k_cut;
   const float pole = bau__pole(s->cut, rate);
   for (int i = 0; i < n; ++i) {
     s->lp[0] += (mono[i] - s->lp[0]) * pole;
     s->lp[1] += (s->lp[0] - s->lp[1]) * pole;
     s->ring[(s->ring_at + i) & s->ring_mask] = s->lp[1];
   }
-  /* The delay: eased toward its target at up to 5% (pitch, as it moves);
-   * further off than a quarter second, jumped. */
-  if (fabsf(s->to_delay - s->delay) > 0.25f * (float)rate) s->delay = s->to_delay;
-  const float slew = 0.05f, amp_ease = 1.0f - expf(-1.0f / (0.01f * (float)rate));
+  /* (Further off than a quarter second at once: a jump, not a glide.) */
+  if (fabsf(s->to_delay - s->delay) > 0.25f * (float)rate) s->delay = s->delay_mid = s->to_delay;
   float ear_pole[2];
   for (int e = 0; e < 2; ++e) {
-    s->shadow[e] += (s->to_shadow[e] - s->shadow[e]) * 0.3f;
+    s->shadow[e] += (s->to_shadow[e] - s->shadow[e]) * k_cut;
     ear_pole[e] = bau__pole(s->shadow[e], rate);
   }
-  float g0[BAU__MAX_CHANNELS], dg[BAU__MAX_CHANNELS], itd0[2], ditd[2];
-  for (int c = 0; c < ch; ++c) g0[c] = s->gains[c], dg[c] = (s->to_gains[c] - s->gains[c]) / (float)n;
-  for (int e = 0; e < 2; ++e) itd0[e] = s->itd[e], ditd[e] = (s->to_itd[e] - s->itd[e]) / (float)n;
+  /* The panning: toward its target this chunk, ramped across it. */
+  float g0[BAU__MAX_CHANNELS], dg[BAU__MAX_CHANNELS];
+  for (int c = 0; c < ch; ++c) {
+    const float to = s->gains[c] + (s->to_gains[c] - s->gains[c]) * k_pan;
+    g0[c] = s->gains[c], dg[c] = (to - s->gains[c]) / (float)n, s->gains[c] = to;
+  }
+  /* (Its rate kept under 8%: a pitch never bent past that, whatever.) */
+  const float most = 0.08f;
   for (int i = 0; i < n; ++i) {
-    const float diff = s->to_delay - s->delay;
-    s->delay += diff > slew ? slew : diff < -slew ? -slew : diff;
-    s->amp += (s->to_amp - s->amp) * amp_ease;
+    s->delay_mid += (s->to_delay - s->delay_mid) * k_delay;
+    const float step = (s->delay_mid - s->delay) * k_delay;
+    s->delay += step > most ? most : step < -most ? -most : step;
+    s->amp += (s->to_amp - s->amp) * k_amp;
     const int at = s->ring_at + i;
     float* o = out + (size_t)i * ch;
     if (headphones) {
       float ear[2];
       for (int e = 0; e < 2; ++e) {
-        const float v = bau__tap(s, at, s->delay + itd0[e] + ditd[e] * (float)i) * s->amp;
+        s->itd_mid[e] += (s->to_itd[e] - s->itd_mid[e]) * k_itd;
+        s->itd[e] += (s->itd_mid[e] - s->itd[e]) * k_itd;
+        const float v = bau__tap(s, at, s->delay + s->itd[e]) * s->amp;
         s->ear[e] += (v - s->ear[e]) * ear_pole[e];
         ear[e] = s->ear[e];
       }
@@ -209,8 +219,6 @@ static void bau__source_chunk(bau_context* au, bau_source* s, float* out, float*
     }
   }
   s->ring_at = (s->ring_at + n) & s->ring_mask;
-  memcpy(s->gains, s->to_gains, sizeof s->gains);
-  memcpy(s->itd, s->to_itd, sizeof s->itd);
 }
 
 void bau_render(bau_context* au, float* out, int frames) {

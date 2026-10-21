@@ -38,7 +38,12 @@ typedef pthread_mutex_t bau__mutex;
 #define BAU__CHUNK 256               /* frames rendered at a time */
 #define BAU__MAX_CHANNELS 8
 #define BAU__DEBUG_RAYS 96
-#define BAU__BLEND 0.35f             /* each simulate's share of what's published */
+#define BAU__BLEND_STILL 0.12f       /* each simulate's share of what's published, nothing moving */
+#define BAU__BLEND_MOVING 0.5f       /* ...the listener or the source moved (BAU__MOVED m since) */
+#define BAU__MOVED 0.3f
+#define BAU__OCCLUSION_RAYS 12       /* straight to a source: points over a square about it */
+#define BAU__OCCLUSION_SPREAD 0.75f  /* m: the square's half width */
+#define BAU__TAPS 6                  /* the reverb's echo taps, fading in and out */
 #define BAU__PI 3.14159265358979f
 
 /* ----------------------------------------------------------- vectors */
@@ -100,11 +105,12 @@ typedef struct bau__hit {
 /* world.c: the nearest solid along o + d t (d unit), tmin < t < tmax: 1 and
  * `hit`, else 0. (World lock held.) */
 int bau__trace(const bau_context* au, bau__v3 o, bau__v3 d, float tmin, float tmax, bau__hit* hit);
-/* Nothing solid between: 1. */
-int bau__clear(const bau_context* au, bau__v3 o, bau__v3 d, float tmin, float tmax);
+/* Nothing solid between: 1. (`skip`: a grid not looked at, a source's own;
+ * NULL: none.) */
+int bau__clear(const bau_context* au, bau__v3 o, bau__v3 d, float tmin, float tmax, const bau_grid* skip);
 /* What gets through, each band (every solid cell crossed its material's
  * transmission); its solid cells counted (0: clear). */
-int bau__transmit(const bau_context* au, bau__v3 o, bau__v3 d, float tmin, float tmax, float t[BAU__BANDS]);
+int bau__transmit(const bau_context* au, bau__v3 o, bau__v3 d, float tmin, float tmax, float t[BAU__BANDS], const bau_grid* skip);
 void bau__grid_apply_pose(bau_grid* grid);
 
 /* ----------------------------------------------------------- sources */
@@ -115,24 +121,26 @@ struct bau_source {
   void* user;
   /* The game's (state lock). */
   float pos[3], gain, ref, max, radius;
-  int dead;
-  /* The simulation's, published (state lock). */
+  const bau_grid* grid;       /* its own (a vehicle's: not in its way); NULL: none */
+  /* The simulation's, published (state lock): what changes slowly. Where
+   * it is and where the listener is are taken as they are at render time. */
   int simulated, occluded, reached;
-  float distance, reach;
-  float direct[BAU__BANDS];   /* intensity relative to free field, straight */
-  float reflected[BAU__BANDS];/* off the walls */
+  float reach;
+  float through[BAU__BANDS];  /* straight: what gets through what's between (1: clear), no air */
+  float reflected[BAU__BANDS];/* off the walls: intensity relative to free field */
   float arrive[3];            /* the reflections' directions, summed (weighted) */
-  float path;                 /* the reflections' mean length (m) */
+  float detour;               /* m: the shortest way round's length past the straight line */
+  float simulated_at[3];      /* (where it was then: moving, the next one's blended in faster) */
   /* The render thread's. */
   float* ring;
   int ring_mask, ring_at;
   int started, ended, tail;   /* (tail: frames still to play out once ended) */
-  float delay, amp, cut;
+  float delay, delay_mid, amp, cut;  /* (the delay smoothed twice: its pitch never stepping) */
   /* (Its targets, this render call's.) */
   float to_delay, to_amp, to_cut, to_gains[BAU__MAX_CHANNELS], to_itd[2], to_shadow[2];
   float lp[2];                /* the muffle: two one-poles */
   float gains[BAU__MAX_CHANNELS];
-  float itd[2], shadow[2], ear[2];
+  float itd[2], itd_mid[2], shadow[2], ear[2];
   bau_source* next;
 };
 
@@ -158,6 +166,8 @@ struct bau_context {
   bau_source* sources;
   float listener[9];          /* pos, ahead, up (state lock) */
   uint32_t rng;
+  uint32_t simulations;       /* (the rays' turn: the next in an even sequence) */
+  float simulated_from[3];    /* (where the listener was last simulate) */
   /* Published (state lock). */
   bau_echo echo;
   float hist[BAU__BINS];
@@ -172,7 +182,8 @@ struct bau_context {
   float mono[BAU__CHUNK], send[BAU__CHUNK], wet[BAU__CHUNK * BAU__MAX_CHANNELS];
 };
 
-/* context.c: what a source is heard as (state lock held). */
+/* context.c: what a source is heard as, with it and the listener where
+ * they are now (state lock held). */
 void bau__heard(const bau_source* src, bau_heard* out);
 
 /* render.c: a source's render state for the context's rate; freed. */

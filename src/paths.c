@@ -9,15 +9,16 @@ typedef struct bau__target {
   const bau_source* src;
   bau__v3 pos;
   float radius;
+  const bau_grid* grid;  /* (its own: not in its way) */
 } bau__target;
 
 /* Nothing between a and b (the last `skip` m of it ignored: the source's
  * own size, the listener's). */
-static int bau__sees(const bau_context* au, bau__v3 a, bau__v3 b, float skip) {
+static int bau__sees(const bau_context* au, bau__v3 a, bau__v3 b, float skip, const bau_grid* own) {
   const bau__v3 d = bau__sub(b, a);
   const float len = bau__len(d);
   if (len < 0.5f) return 1;
-  return bau__clear(au, a, bau__mul(d, 1.0f / len), 0.0f, len - skip);
+  return bau__clear(au, a, bau__mul(d, 1.0f / len), 0.0f, len - skip, own);
 }
 
 /* A branch off path `parent` at its point `k`, straight to `to`. */
@@ -61,6 +62,7 @@ int bau_debug_paths(bau_context* au, const bau_path_config* config, bau_path* ou
     int i = 0;
     for (const bau_source* s = au->sources; s; s = s->next, ++i) {
       targets[i].src = s, targets[i].pos = bau__vp(s->pos), targets[i].radius = s->radius > 0.4f ? s->radius : 0.4f;
+      targets[i].grid = s->grid;
       if (c.flat) targets[i].pos.y = L.y;  /* (seen at the listener's height) */
     }
   }
@@ -109,9 +111,9 @@ int bau_debug_paths(bau_context* au, const bau_path_config* config, bau_path* ou
       /* What this bounce sees: the sources, the listener (branches,
        * written after this path in `out`). */
       for (int s = 0; s < ns; ++s)
-        if (bau__sees(au, off, targets[s].pos, targets[s].radius))
+        if (bau__sees(au, off, targets[s].pos, targets[s].radius, targets[s].grid))
           bau__branch(out, &n, max, BAU_PATH_FOUND, pi, k, off, targets[s].pos, targets[s].src);
-      if (bau__sees(au, off, L, lr > 0.4f ? lr : 0.4f)) bau__branch(out, &n, max, BAU_PATH_ECHO, pi, k, off, L, NULL);
+      if (bau__sees(au, off, L, lr > 0.4f ? lr : 0.4f, NULL)) bau__branch(out, &n, max, BAU_PATH_ECHO, pi, k, off, L, NULL);
       /* On: a mirror's way (kept level, flat). */
       d = bau__sub(d, bau__mul(h.normal, 2.0f * bau__dot(d, h.normal)));
       if (c.flat) d.y = 0.0f;

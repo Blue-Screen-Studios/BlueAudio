@@ -151,6 +151,11 @@ void bau_grid_destroy(bau_grid* g) {
       *at = g->next;
       break;
     }
+  /* (The sources it was the grid of: theirs no more.) */
+  bau__lock(&au->state);
+  for (bau_source* s = au->sources; s; s = s->next)
+    if (s->grid == g) s->grid = NULL;
+  bau__unlock(&au->state);
   bau__unlock(&au->world);
   free(g->pool), free(g->bricks), free(g);
 }
@@ -256,18 +261,19 @@ int bau__trace(const bau_context* au, bau__v3 o, bau__v3 d, float tmin, float tm
   return found;
 }
 
-int bau__clear(const bau_context* au, bau__v3 o, bau__v3 d, float tmin, float tmax) {
+int bau__clear(const bau_context* au, bau__v3 o, bau__v3 d, float tmin, float tmax, const bau_grid* skip) {
   if (tmax <= tmin) return 1;
   for (const bau_grid* g = au->grids; g; g = g->next)
-    if (bau__walk(au, g, o, d, tmin, tmax, BAU__ANY, NULL, NULL)) return 0;
+    if (g != skip && bau__walk(au, g, o, d, tmin, tmax, BAU__ANY, NULL, NULL)) return 0;
   return 1;
 }
 
-int bau__transmit(const bau_context* au, bau__v3 o, bau__v3 d, float tmin, float tmax, float t[BAU__BANDS]) {
+int bau__transmit(const bau_context* au, bau__v3 o, bau__v3 d, float tmin, float tmax, float t[BAU__BANDS], const bau_grid* skip) {
   int cells = 0;
   for (int b = 0; b < BAU__BANDS; ++b) t[b] = 1.0f;
   if (tmax <= tmin) return 0;
-  for (const bau_grid* g = au->grids; g; g = g->next) cells += bau__walk(au, g, o, d, tmin, tmax, BAU__THROUGH, NULL, t);
+  for (const bau_grid* g = au->grids; g; g = g->next)
+    if (g != skip) cells += bau__walk(au, g, o, d, tmin, tmax, BAU__THROUGH, NULL, t);
   return cells;
 }
 

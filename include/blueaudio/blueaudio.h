@@ -182,6 +182,10 @@ BAU_API void bau_source_set_rolloff(bau_source* src, float ref, float max);
 /* Its size: solids within `radius` m of it ignored (an engine inside its
  * own truck's voxels). Default 0.5. */
 BAU_API void bau_source_set_radius(bau_source* src, float radius);
+/* The grid it's part of (a vehicle's engine, its horn: inside the
+ * vehicle's own voxels): never in its own way. NULL: none. Destroying the
+ * grid unties it. */
+BAU_API void bau_source_set_grid(bau_source* src, const bau_grid* grid);
 BAU_API void* bau_source_user(const bau_source* src);
 /* Its callback's ended and what's left of it played out (its delay): the
  * game can destroy it. */
@@ -192,7 +196,11 @@ BAU_API void bau_source_destroy(bau_source* src);
 
 /* Trace: rays from the listener, the sources' muffle, direction, distance,
  * the echo. Blends with what was traced before (rays a little different
- * each time: smooth, accumulating), so call it often (~30 Hz). */
+ * each time: smooth, accumulating; faster while things move), so call it
+ * often (~30 Hz). What it works out is what changes slowly (what's in the
+ * way, what comes off the walls, the way round); where each source and the
+ * listener are is taken as it is at render time, so movement (distance,
+ * delay, Doppler, the straight way) is as smooth as the game's frames. */
 BAU_API void bau_simulate(bau_context* au);
 /* The final mix: `frames` frames into `out` (frames * bau_channels floats,
  * interleaved), overwritten. Each source's callback called for its block,
@@ -212,7 +220,7 @@ typedef struct bau_heard {
   float gain BAU_ZERO;      /* gain, both, its rolloff in it */
   float direction[3] BAU_ZERO; /* world: from the listener, the way it's heard from */
   float spread BAU_ZERO;    /* 0: all from that way .. 1: all about */
-  float delay BAU_ZERO;     /* s */
+  float delay BAU_ZERO;     /* s: when it first arrives (straight; hidden, round the shortest way) */
 } bau_heard;
 BAU_API void bau_source_heard(const bau_source* src, bau_heard* out);
 
